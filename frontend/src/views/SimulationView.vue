@@ -154,19 +154,30 @@ const handleNextStep = (params = {}) => {
   } else {
     addLog('使用自动配置的模拟轮数')
   }
+  if (params.selectedAgentIds?.length) {
+    addLog(`本次选中 ${params.selectedAgentIds.length} 个 Agent 参与模拟`)
+  }
   
   // 构建路由参数
   const routeParams = {
     name: 'SimulationRun',
-    params: { simulationId: currentSimulationId.value }
+    params: { simulationId: currentSimulationId.value },
+    query: {}
   }
   
   // 如果有自定义轮数，通过 query 参数传递
   if (params.maxRounds) {
-    routeParams.query = { maxRounds: params.maxRounds }
+    routeParams.query.maxRounds = params.maxRounds
+  }
+  if (params.selectedAgentIds?.length) {
+    routeParams.query.selectedAgentIds = params.selectedAgentIds.join(',')
   }
   
   // 跳转到 Step 3 页面
+  if (!Object.keys(routeParams.query).length) {
+    delete routeParams.query
+  }
+
   router.push(routeParams)
 }
 

@@ -299,6 +299,10 @@ import { generateReport } from '../api/report'
 const props = defineProps({
   simulationId: String,
   maxRounds: Number, // 从Step2传入的最大轮数
+  selectedAgentIds: {
+    type: Array,
+    default: () => []
+  },
   minutesPerRound: {
     type: Number,
     default: 30 // 默认每轮30分钟
@@ -402,6 +406,10 @@ const doStartSimulation = async () => {
     if (props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(`设置最大模拟轮数: ${props.maxRounds}`)
+    }
+    if (props.selectedAgentIds.length) {
+      params.selected_agent_ids = props.selectedAgentIds
+      addLog(`设置参与模拟的 Agent 数量: ${props.selectedAgentIds.length}`)
     }
     
     addLog('已开启动态图谱更新模式')

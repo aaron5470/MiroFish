@@ -3,7 +3,10 @@
 Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
 """
 
+import csv
+import json
 import os
+import shutil
 import traceback
 from flask import request, jsonify, send_file
 
@@ -17,6 +20,180 @@ from ..utils.logger import get_logger
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
+
+
+SIMULATION_SELECTION_BACKUPS = {
+    "config": ("simulation_config.full.json", "simulation_config.json"),
+    "reddit": ("reddit_profiles.full.json", "reddit_profiles.json"),
+    "twitter": ("twitter_profiles.full.csv", "twitter_profiles.csv"),
+}
+
+
+def _ensure_selection_backup(sim_dir: str, backup_name: str, source_name: str) -> str:
+    """确保筛选前的原始文件有备份。"""
+    backup_path = os.path.join(sim_dir, backup_name)
+    source_path = os.path.join(sim_dir, source_name)
+
+    if os.path.exists(backup_path):
+        return backup_path
+
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"缺少文件: {source_name}")
+
+    shutil.copy2(source_path, backup_path)
+    return backup_path
+
+
+def _load_original_simulation_assets(sim_dir: str):
+    config_backup = _ensure_selection_backup(sim_dir, *SIMULATION_SELECTION_BACKUPS["config"])
+
+    with open(config_backup, 'r', encoding='utf-8') as f:
+        original_config = json.load(f)
+
+    reddit_profiles = None
+    reddit_source = os.path.join(sim_dir, SIMULATION_SELECTION_BACKUPS["reddit"][1])
+    if os.path.exists(reddit_source) or os.path.exists(os.path.join(sim_dir, SIMULATION_SELECTION_BACKUPS["reddit"][0])):
+        reddit_backup = _ensure_selection_backup(sim_dir, *SIMULATION_SELECTION_BACKUPS["reddit"])
+        with open(reddit_backup, 'r', encoding='utf-8') as f:
+            reddit_profiles = json.load(f)
+
+    twitter_profiles = None
+    twitter_source = os.path.join(sim_dir, SIMULATION_SELECTION_BACKUPS["twitter"][1])
+    if os.path.exists(twitter_source) or os.path.exists(os.path.join(sim_dir, SIMULATION_SELECTION_BACKUPS["twitter"][0])):
+        twitter_backup = _ensure_selection_backup(sim_dir, *SIMULATION_SELECTION_BACKUPS["twitter"])
+        with open(twitter_backup, 'r', encoding='utf-8') as f:
+            twitter_profiles = list(csv.DictReader(f))
+
+    return original_config, reddit_profiles, twitter_profiles
+
+
+def _write_filtered_twitter_profiles(file_path: str, profiles):
+    headers = ['user_id', 'name', 'username', 'user_char', 'description']
+    with open(file_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for profile in profiles:
+            writer.writerow({key: profile.get(key, '') for key in headers})
+
+
+def _apply_selected_agents(simulation_id: str, selected_agent_ids=None):
+    sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+    if not os.path.exists(sim_dir):
+        raise FileNotFoundError(f"模拟不存在: {simulation_id}")
+
+    original_config, reddit_profiles, twitter_profiles = _load_original_simulation_assets(sim_dir)
+    original_agent_configs = original_config.get('agent_configs', [])
+    if not original_agent_configs:
+        raise ValueError('simulation_config.json 中缺少 agent_configs')
+
+    available_agent_ids = [cfg.get('agent_id') for cfg in original_agent_configs if cfg.get('agent_id') is not None]
+    available_agent_ids = [int(agent_id) for agent_id in available_agent_ids]
+
+    if selected_agent_ids is None:
+        normalized_selection = available_agent_ids
+    else:
+        normalized_selection = []
+        seen = set()
+        for agent_id in selected_agent_ids:
+            try:
+                parsed_id = int(agent_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"selected_agent_ids 包含无效值: {agent_id}")
+            if parsed_id in seen:
+                continue
+            seen.add(parsed_id)
+            normalized_selection.append(parsed_id)
+
+    if not normalized_selection:
+        raise ValueError('selected_agent_ids 至少需要包含 1 个 Agent')
+
+    invalid_ids = [agent_id for agent_id in normalized_selection if agent_id not in available_agent_ids]
+    if invalid_ids:
+        raise ValueError(f"selected_agent_ids 包含不存在的 Agent: {invalid_ids}")
+
+    selection_set = set(normalized_selection)
+    filtered_agent_configs = [
+        json.loads(json.dumps(cfg))
+        for cfg in original_agent_configs
+        if int(cfg.get('agent_id')) in selection_set
+    ]
+    filtered_agent_configs.sort(key=lambda cfg: available_agent_ids.index(int(cfg.get('agent_id'))))
+    agent_id_remap = {int(cfg.get('agent_id')): new_id for new_id, cfg in enumerate(filtered_agent_configs)}
+
+    for cfg in filtered_agent_configs:
+        cfg['agent_id'] = agent_id_remap[int(cfg.get('agent_id'))]
+
+    filtered_config = json.loads(json.dumps(original_config))
+    filtered_config['agent_configs'] = filtered_agent_configs
+
+    initial_posts = filtered_config.get('event_config', {}).get('initial_posts', [])
+    fallback_agent_id = 0
+    for post in initial_posts:
+        poster_agent_id = post.get('poster_agent_id')
+        if poster_agent_id is None:
+            continue
+        try:
+            poster_agent_id = int(poster_agent_id)
+        except (TypeError, ValueError):
+            post['poster_agent_id'] = fallback_agent_id
+            continue
+        post['poster_agent_id'] = agent_id_remap.get(poster_agent_id, fallback_agent_id)
+
+    if reddit_profiles is not None:
+        reddit_map = {}
+        for idx, profile in enumerate(reddit_profiles):
+            raw_id = profile.get('user_id', idx)
+            try:
+                profile_id = int(raw_id)
+            except (TypeError, ValueError):
+                profile_id = idx
+            reddit_map[profile_id] = profile
+
+        filtered_reddit_profiles = []
+        for old_agent_id, new_agent_id in agent_id_remap.items():
+            profile = json.loads(json.dumps(reddit_map.get(old_agent_id, {})))
+            if not profile:
+                continue
+            profile['user_id'] = new_agent_id
+            filtered_reddit_profiles.append(profile)
+
+        with open(os.path.join(sim_dir, 'reddit_profiles.json'), 'w', encoding='utf-8') as f:
+            json.dump(filtered_reddit_profiles, f, ensure_ascii=False, indent=2)
+
+    if twitter_profiles is not None:
+        twitter_map = {}
+        for idx, profile in enumerate(twitter_profiles):
+            raw_id = profile.get('user_id', idx)
+            try:
+                profile_id = int(raw_id)
+            except (TypeError, ValueError):
+                profile_id = idx
+            twitter_map[profile_id] = profile
+
+        filtered_twitter_profiles = []
+        for old_agent_id, new_agent_id in agent_id_remap.items():
+            profile = dict(twitter_map.get(old_agent_id, {}))
+            if not profile:
+                continue
+            profile['user_id'] = new_agent_id
+            filtered_twitter_profiles.append(profile)
+
+        _write_filtered_twitter_profiles(os.path.join(sim_dir, 'twitter_profiles.csv'), filtered_twitter_profiles)
+
+    filtered_config['selection_metadata'] = {
+        'selected_agent_ids': normalized_selection,
+        'selected_agent_count': len(filtered_agent_configs),
+        'original_agent_count': len(original_agent_configs),
+    }
+
+    with open(os.path.join(sim_dir, 'simulation_config.json'), 'w', encoding='utf-8') as f:
+        json.dump(filtered_config, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        f"已应用Agent筛选: simulation_id={simulation_id}, selected={len(filtered_agent_configs)}/{len(original_agent_configs)}"
+    )
+
+    return filtered_config['selection_metadata']
 
 
 # Interview prompt 优化前缀
@@ -1453,6 +1630,7 @@ def start_simulation():
             "simulation_id": "sim_xxxx",          // 必填，模拟ID
             "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)
             "max_rounds": 100,                     // 可选: 最大模拟轮数，用于截断过长的模拟
+            "selected_agent_ids": [0, 1, 2],       // 可选: 参与本次模拟的Agent ID列表
             "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到Zep图谱记忆
             "force": false                         // 可选: 强制重新开始（会停止运行中的模拟并清理日志）
         }
@@ -1497,6 +1675,7 @@ def start_simulation():
         platform = data.get('platform', 'parallel')
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
+        selected_agent_ids = data.get('selected_agent_ids')  # 可选：参与模拟的Agent ID列表
         force = data.get('force', False)  # 可选：强制重新开始
 
         # 验证 max_rounds 参数
@@ -1595,6 +1774,9 @@ def start_simulation():
             
             logger.info(f"启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
         
+        # 根据用户勾选结果更新本次运行使用的 Agent / 配置
+        selection_metadata = _apply_selected_agents(simulation_id, selected_agent_ids)
+
         # 启动模拟
         run_state = SimulationRunner.start_simulation(
             simulation_id=simulation_id,
@@ -1611,6 +1793,7 @@ def start_simulation():
         response_data = run_state.to_dict()
         if max_rounds:
             response_data['max_rounds_applied'] = max_rounds
+        response_data['selection_metadata'] = selection_metadata
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
         if enable_graph_memory_update:
