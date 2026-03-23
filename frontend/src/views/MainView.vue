@@ -165,6 +165,9 @@ const handleNextStep = (params = {}) => {
     if (currentStep.value === 3 && params.maxRounds) {
       addLog(`自定义模拟轮数: ${params.maxRounds} 轮`)
     }
+    if (currentStep.value === 3 && params.selectedAgentIds?.length) {
+      addLog(`本次选中 ${params.selectedAgentIds.length} 个 Agent 参与模拟`)
+    }
   }
 }
 
